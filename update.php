@@ -10,7 +10,7 @@
  *
  * Creation Date: 2021-04-16 07:54:31
  * Modified by:   Mario Ravalli
- * Last Modified: 2021-04-16 12:38:36
+ * Last Modified: 2021-04-16 16:42:20
  */
 
 require('config.php');
@@ -21,7 +21,7 @@ $hostname = filter_input(INPUT_GET, 'hostname', FILTER_VALIDATE_DOMAIN, FILTER_F
 $ipaddress = filter_input(INPUT_GET, 'myip', FILTER_VALIDATE_IP);
 
 openlog("DynISP-Provider", LOG_PID | LOG_PERROR, LOG_LOCAL0);
-ob_start();
+
 if (empty($username) || empty($password)) {
     syslog(LOG_WARN, "Username and password must be set!");
     header('HTTP/1.0 401 Unauthorized');
@@ -35,7 +35,7 @@ if (!in_array($hostname, $user_domain[$username]['domains'])) {
     closelog();
     exit;
 }
-if ($password != $user_domain[$username]['pass']) {
+if ($password != $user_domain[$username]['password']) {
     syslog(LOG_WARN, "Username and password must be set!");
     header('HTTP/1.0 401 Unauthorized');
     echo "Username or password do not match!";
@@ -49,6 +49,21 @@ if (empty($hostname) || empty($ipaddress)) {
     exit;
 }
 
+$domainname = implode('.', array_slice(preg_split('/\./', $hostname), -2, 2));
+$hostname = substr(strstr($hostname, $domainname, true), 0, -1);
+
+$opts = [
+'ssl' => [
+  // set some SSL/TLS specific options
+  'verify_peer' => false,
+  'verify_peer_name' => false,
+  'allow_self_signed' => true
+],
+  'http'=>[
+    'user_agent' => 'PHPSoapClient'
+  ]
+];
+
 // Using the SOAP module initialize a SoapClient
 $client = new SoapClient(
     null,
@@ -56,7 +71,14 @@ $client = new SoapClient(
         'location'   => $soap_location,
         'uri'        => $soap_uri,
         'trace'      => 1,
-        'exceptions' => 1
+        'exceptions' => 1,
+        'stream_context' => stream_context_create([
+            'ssl' => [
+                'verify_peer' => false,
+                'verify_peer_name' => false,
+                'allow_self_signed' => true
+            ],
+        ])
     ]
 );
 
@@ -65,16 +87,18 @@ try {
     $session_id = $client->login($soap_username, $soap_password);
 
     // Grab DNS zone ID
-    $zone_id = $client->dns_zone_get_id($session_id, $hostname);
+    $zone_id = $client->dns_zone_get_id($session_id, $domainname);
+
     // Grab DNS zone
     $zone = $client->dns_zone_get($session_id, $zone_id);
+
     // Grab DNS records
     $records = $client->dns_rr_get_all_by_zone($session_id, $zone_id);
     
     // Find right record: hostname must match and type must be A
     $dns_record = null;
     foreach ($records as $rec) {
-        if ($rec['type']=='A' && $rec['name']==$ddns_host) {
+        if ($rec['type']=='A' && $rec['name']==$hostname) {
             $dns_record = $rec;
         }
     }
@@ -82,15 +106,15 @@ try {
     if (is_null($dns_record)) {
         //Logout from SOAP server
         $client->logout($session_id);
-        syslog(LOG_ERROR, "Unable to find DNS record for host $ddns_host in domain $domain on the server...");
+        syslog(LOG_ERR, "Unable to find DNS record for host $hostname in domain $domainname on the server...");
         echo "nohost";
         closelog();
         exit;
     }
     // If IP stored in record is different from current IP
-    if ($dns_record['data'] != $ip) {
+    if ($dns_record['data'] != $ipaddress) {
         // Set new IP
-        $dns_record['data'] = $ip;
+        $dns_record['data'] = $ipaddress;
         // Increment record serial number
         $dns_record['serial'] = $dns_record['serial']+1;
         // Update modified record in DNS server
@@ -101,13 +125,13 @@ try {
         // Update modified zone in DNS server
         $client->dns_zone_update($session_id, 0, $zone_id, $zone);
         
-        syslog(LOG_INFO, "Successfully set DNS entry for host $ddns_host in domain $domain to $ip.");
+        syslog(LOG_INFO, "Successfully set DNS entry for host $hostname in domain $domainname to $ipaddress.");
         echo "good ";
         closelog();
         exit;
     // Otherwise
     } else {
-        syslog(LOG_INFO, "IP address of $ddns_host.$domain already set to $ip.");
+        syslog(LOG_WARN, "IP address of $hostname.$domainname already set to $ipaddress.");
         echo "nochg";
         closelog();
         exit;
@@ -116,5 +140,5 @@ try {
     //Logout from SOAP server
     $client->logout($session_id);
 } catch (SoapFault $e) {
-    die('SOAP Error: '.$e->getMessage()."\n");
+    syslog(LOG_Err, 'SOAP Error: '. $e->getMessage());
 }
